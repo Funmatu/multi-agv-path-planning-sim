@@ -1,0 +1,953 @@
+<html>
+<head>
+  <title>Multi-AGV Path Planning - A* vs D*</title>
+  <style>
+    svg {
+      border: 1px solid black;
+      margin-bottom: 20px;
+    }
+    .node {
+      stroke: black;
+      stroke-width: 1px;
+      fill: white;
+    }
+    .open {
+      fill: lightblue;
+      opacity: 0.7;
+    }
+    .closed {
+      fill: lightgreen;
+      opacity: 0.7;
+    }
+    .path {
+      stroke-width: 3px;
+    }
+    .obstacle {
+      fill: black;
+    }
+    .agv {
+      stroke: black;
+      stroke-width: 2px;
+    }
+    .goal {
+      fill: blue;
+      opacity: 0.7;
+    }
+    .controls {
+      margin-bottom: 20px;
+    }
+    .info {
+      margin-top: 20px;
+      font-family: Arial, sans-serif;
+    }
+    .legend {
+      display: flex;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      margin-right: 20px;
+      margin-bottom: 5px;
+    }
+    .legend-color {
+      width: 20px;
+      height: 20px;
+      margin-right: 5px;
+      border: 1px solid black;
+    }
+    .stats {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 20px;
+    }
+    .stats-column {
+      flex: 1;
+      margin-right: 20px;
+    }
+    .waiting {
+      animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; }
+      50% { opacity: 0.5; }
+      100% { opacity: 1; }
+    }
+    .completed {
+      font-weight: bold;
+      color: green;
+    }
+    .scenario-select {
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Multi-AGV Path Planning - A* vs D*</h1>
+  
+  <div class="controls">
+    <div class="scenario-select">
+      <label>シナリオ選択: 
+        <select id="scenario">
+          <option value="crossing">交差経路シナリオ</option>
+          <option value="bottleneck">ボトルネックシナリオ</option>
+          <option value="random">ランダムシナリオ</option>
+        </select>
+      </label>
+      <button onclick="setupSelectedScenario()">シナリオを設定</button>
+    </div>
+    
+    <button onclick="runSimulation('astar')">Run A* Simulation</button>
+    <button onclick="runSimulation('dstar')">Run D* Simulation</button>
+    <button onclick="addObstacle()">Add Static Obstacle</button>
+    <button onclick="resetSimulation()">Reset Simulation</button>
+    <label>Number of AGVs: 
+      <select id="agvCount">
+        <option value="4">4</option>
+        <option value="6">6</option>
+        <option value="8" selected>8</option>
+        <option value="10">10</option>
+      </select>
+    </label>
+    <label>Simulation Speed: 
+      <select id="simSpeed">
+        <option value="300">Fast</option>
+        <option value="600" selected>Normal</option>
+        <option value="1200">Slow</option>
+      </select>
+    </label>
+  </div>
+
+  <svg id="grid" width="600" height="600"></svg>
+
+  <div class="stats">
+    <div class="stats-column">
+      <h2>シミュレーション情報</h2>
+      <div id="status">Status: Ready to start</div>
+      <div id="collisions">Collisions avoided: 0</div>
+      <div id="pathReplans">Path replans: 0</div>
+      <div id="completionTime">Completion time: -</div>
+      
+      <div class="legend">
+        <h3>Legend:</h3>
+        <div class="legend-item">
+          <div class="legend-color" style="background-color: black;"></div>
+          <span>Static Obstacle</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color" style="background-color: lightblue;"></div>
+          <span>Open Node</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color" style="background-color: lightgreen;"></div>
+          <span>Closed Node</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color" style="background-color: blue; opacity: 0.7;"></div>
+          <span>Goal</span>
+        </div>
+      </div>
+    </div>
+    
+    <div class="stats-column">
+      <h2>AGV状態</h2>
+      <div id="agv-status"></div>
+    </div>
+  </div>
+
+  <script>
+    const gridWidth = 30;
+    const gridHeight = 30;
+    const cellSize = 20;
+    let obstacles = [];
+    let gridData = [];
+    let agvs = [];
+    let algorithmRunning = false;
+    let currentAlgorithm = '';
+    let collisionsAvoided = 0;
+    let pathReplans = 0;
+    let simulationInterval;
+    let simulationStartTime;
+    let waitingCycles = {}; // 各AGVの待機サイクル数を追跡
+
+    // 色の配列（AGVとその経路用）
+    const colors = [
+      "#FF0000", // 赤
+      "#00CC00", // 緑
+      "#FF6600", // オレンジ
+      "#9900CC", // 紫
+      "#0066FF", // 青
+      "#FF3399", // ピンク
+      "#FFCC00", // 黄色
+      "#00CCCC", // シアン
+      "#CC6600", // 茶色
+      "#6600CC"  // 紫青
+    ];
+
+    // AGVクラス
+    class AGV {
+      constructor(id, x, y, goalX, goalY) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.goalX = goalX;
+        this.goalY = goalY;
+        this.path = [];
+        this.currentPathIndex = 0;
+        this.color = colors[id % colors.length];
+        this.openSet = [];
+        this.closedSet = [];
+        this.reachedGoal = false;
+        this.needsReplanning = false;
+        this.isWaiting = false;
+        this.waitingTime = 0;
+        this.totalDistance = 0;
+      }
+
+      // 現在位置を更新
+      move() {
+        if (this.reachedGoal || this.path.length === 0 || this.currentPathIndex >= this.path.length) {
+          return false;
+        }
+
+        if (this.isWaiting) {
+          this.waitingTime++;
+          return false;
+        }
+
+        const nextNode = this.path[this.currentPathIndex];
+        this.totalDistance += Math.sqrt(Math.pow(nextNode.x - this.x, 2) + Math.pow(nextNode.y - this.y, 2));
+        this.x = nextNode.x;
+        this.y = nextNode.y;
+        this.currentPathIndex++;
+
+        // ゴールに到達したか確認
+        if (this.x === this.goalX && this.y === this.goalY) {
+          this.reachedGoal = true;
+          updateStatus(`AGV ${this.id + 1} reached its goal!`);
+        }
+
+        return true;
+      }
+
+      // 他のAGVと衝突するか確認
+      willCollideWith(otherAGVs) {
+        if (this.path.length === 0 || this.currentPathIndex >= this.path.length) {
+          return false;
+        }
+
+        const nextNode = this.path[this.currentPathIndex];
+        
+        for (const agv of otherAGVs) {
+          if (agv.id === this.id || agv.reachedGoal) continue;
+          
+          // 次の位置が他のAGVの現在位置と同じか
+          if (nextNode.x === agv.x && nextNode.y === agv.y) {
+            return true;
+          }
+          
+          // パスの交差を検出（AGVが交差する場合）
+          if (agv.path.length > 0 && agv.currentPathIndex < agv.path.length) {
+            const otherNextNode = agv.path[agv.currentPathIndex];
+            
+            // AGVが入れ替わる場合を検出
+            if (nextNode.x === agv.x && nextNode.y === agv.y && 
+                this.x === otherNextNode.x && this.y === otherNextNode.y) {
+              return true;
+            }
+          }
+        }
+        
+        return false;
+      }
+
+      // 経路計画（A*アルゴリズム）
+      planPath(otherAGVs) {
+        this.openSet = [gridData[this.x][this.y]];
+        this.closedSet = [];
+        this.path = [];
+        this.currentPathIndex = 0;
+        this.needsReplanning = false;
+        this.isWaiting = false;
+
+        // 各ノードのg, h, fを初期化
+        for (let x = 0; x < gridWidth; x++) {
+          for (let y = 0; y < gridHeight; y++) {
+            gridData[x][y].g = Infinity;
+            gridData[x][y].h = 0;
+            gridData[x][y].f = Infinity;
+            gridData[x][y].parent = null;
+          }
+        }
+        
+        // 開始ノードの初期化
+        let start = gridData[this.x][this.y];
+        start.g = 0;
+        start.h = heuristic(start, { x: this.goalX, y: this.goalY });
+        start.f = start.g + start.h;
+
+        while (this.openSet.length > 0) {
+          // 最もf値が低いノードを選択
+          let current = this.openSet[0];
+          for (let i = 1; i < this.openSet.length; i++) {
+            if (this.openSet[i].f < current.f) {
+              current = this.openSet[i];
+            }
+          }
+
+          // ゴールに到達
+          if (current.x === this.goalX && current.y === this.goalY) {
+            this.reconstructPath(current);
+            return true;
+          }
+
+          // オープンリストから削除し、クローズリストに追加
+          this.openSet = this.openSet.filter(node => node !== current);
+          this.closedSet.push(current);
+          drawNode(current, 'closed', this.color);
+
+          // 隣接ノードを調べる
+          const neighbors = getNeighbors(current);
+          for (const neighbor of neighbors) {
+            // 障害物またはクローズリストに含まれている場合は無視
+            if (isObstacle(neighbor) || 
+                isOccupiedByOtherAGV(neighbor, this, otherAGVs) ||
+                this.closedSet.some(node => node.x === neighbor.x && node.y === neighbor.y)) {
+              continue;
+            }
+
+            // g値を計算
+            const tentativeGScore = current.g + 1;
+
+            // オープンリストに含まれていない場合、または新しいg値が小さい場合
+            if (!this.openSet.some(node => node.x === neighbor.x && node.y === neighbor.y) || tentativeGScore < neighbor.g) {
+              neighbor.parent = current;
+              neighbor.g = tentativeGScore;
+              neighbor.h = heuristic(neighbor, { x: this.goalX, y: this.goalY });
+              neighbor.f = neighbor.g + neighbor.h;
+
+              if (!this.openSet.some(node => node.x === neighbor.x && node.y === neighbor.y)) {
+                this.openSet.push(neighbor);
+                drawNode(neighbor, 'open', this.color);
+              }
+            }
+          }
+        }
+
+        // 経路が見つからない場合
+        return false;
+      }
+
+      // 動的経路再計画（D*アルゴリズムの簡略版）
+      replanPath(otherAGVs) {
+        pathReplans++;
+        document.getElementById('pathReplans').textContent = `Path replans: ${pathReplans}`;
+        
+        // 現在位置から再計画
+        const success = this.planPath(otherAGVs);
+        
+        // 再計画に成功したら待機状態を解除
+        if (success) {
+          this.isWaiting = false;
+        }
+        
+        return success;
+      }
+
+      // パスを再構築
+      reconstructPath(current) {
+        let temp = current;
+        this.path = [];
+        while (temp.parent) {
+          this.path.push(temp);
+          temp = temp.parent;
+        }
+        this.path.push(gridData[this.x][this.y]);
+        this.path.reverse();
+        this.currentPathIndex = 0;
+
+        // パスの描画
+        for (let i = 0; i < this.path.length - 1; i++) {
+          drawPath(this.path[i], this.path[i + 1], this.color);
+        }
+      }
+    }
+
+    // ヘウリスティック関数 (マンハッタン距離)
+    function heuristic(a, b) {
+      return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+    }
+
+    // グリッドの初期化
+    function initializeGrid() {
+      const svg = document.getElementById('grid');
+      svg.innerHTML = '';
+
+      // グリッドデータの初期化
+      gridData = [];
+      for (let x = 0; x < gridWidth; x++) {
+        gridData[x] = [];
+        for (let y = 0; y < gridHeight; y++) {
+          gridData[x][y] = { x: x, y: y, g: Infinity, h: 0, f: Infinity, parent: null };
+        }
+      }
+
+      // グリッドの描画
+      for (let x = 0; x < gridWidth; x++) {
+        for (let y = 0; y < gridHeight; y++) {
+          const node = document.createElementNS("http://www.w3.org/2000/svg", 'rect');
+          node.setAttribute('x', x * cellSize);
+          node.setAttribute('y', y * cellSize);
+          node.setAttribute('width', cellSize);
+          node.setAttribute('height', cellSize);
+          node.classList.add('node');
+          svg.appendChild(node);
+        }
+      }
+
+      // 障害物の描画
+      obstacles.forEach(obstacle => drawObstacle(obstacle));
+    }
+
+    // 交差経路シナリオの設定
+    function setupCrossingScenario() {
+      obstacles = [];
+      
+      // 外壁の作成
+      for (let x = 0; x < gridWidth; x++) {
+        obstacles.push([x, 0]);
+        obstacles.push([x, gridHeight - 1]);
+      }
+      for (let y = 0; y < gridHeight; y++) {
+        obstacles.push([0, y]);
+        obstacles.push([gridWidth - 1, y]);
+      }
+      
+      // 中央に十字路を作成
+      const centerX = Math.floor(gridWidth / 2);
+      const centerY = Math.floor(gridHeight / 2);
+      const corridorWidth = 3;
+      
+      for (let x = 1; x < gridWidth - 1; x++) {
+        for (let y = 1; y < gridHeight - 1; y++) {
+          // 十字路以外は障害物
+          if (!((Math.abs(x - centerX) <= corridorWidth) || 
+                (Math.abs(y - centerY) <= corridorWidth))) {
+            obstacles.push([x, y]);
+          }
+        }
+      }
+      
+      initializeGrid();
+      
+      // AGVの配置（交差経路になるよう配置）
+      const agvCount = parseInt(document.getElementById('agvCount').value);
+      agvs = [];
+      
+      // 東西南北の端から中心に向かう配置
+      const positions = [
+        // 西から東
+        { start: { x: 1, y: centerY }, goal: { x: gridWidth - 2, y: centerY } },
+        // 東から西
+        { start: { x: gridWidth - 2, y: centerY + 1 }, goal: { x: 1, y: centerY + 1 } },
+        // 北から南
+        { start: { x: centerX, y: 1 }, goal: { x: centerX, y: gridHeight - 2 } },
+        // 南から北
+        { start: { x: centerX + 1, y: gridHeight - 2 }, goal: { x: centerX + 1, y: 1 } },
+        // 北西から南東
+        { start: { x: centerX - corridorWidth, y: centerY - corridorWidth }, 
+          goal: { x: centerX + corridorWidth, y: centerY + corridorWidth } },
+        // 南東から北西
+        { start: { x: centerX + corridorWidth, y: centerY + corridorWidth }, 
+          goal: { x: centerX - corridorWidth, y: centerY - corridorWidth } },
+        // 北東から南西
+        { start: { x: centerX + corridorWidth, y: centerY - corridorWidth }, 
+          goal: { x: centerX - corridorWidth, y: centerY + corridorWidth } },
+        // 南西から北東
+        { start: { x: centerX - corridorWidth, y: centerY + corridorWidth }, 
+          goal: { x: centerX + corridorWidth, y: centerY - corridorWidth } }
+      ];
+      
+      for (let i = 0; i < Math.min(agvCount, positions.length); i++) {
+        const pos = positions[i];
+        const agv = new AGV(i, pos.start.x, pos.start.y, pos.goal.x, pos.goal.y);
+        agvs.push(agv);
+        drawNode({ x: pos.goal.x, y: pos.goal.y }, 'goal', agv.color);
+      }
+      
+      drawAGVs();
+    }
+    
+    // ボトルネックシナリオの設定
+    function setupBottleneckScenario() {
+      obstacles = [];
+      
+      // 外壁の作成
+      for (let x = 0; x < gridWidth; x++) {
+        obstacles.push([x, 0]);
+        obstacles.push([x, gridHeight - 1]);
+      }
+      for (let y = 0; y < gridHeight; y++) {
+        obstacles.push([0, y]);
+        obstacles.push([gridWidth - 1, y]);
+      }
+      
+      // 中央にボトルネックを作成
+      const centerX = Math.floor(gridWidth / 2);
+      const centerY = Math.floor(gridHeight / 2);
+      const passageWidth = 3; // ボトルネックの幅を広げる
+      
+      // 上下の壁を作成し、中央に通路を残す
+      for (let x = centerX - 10; x <= centerX + 10; x++) {
+        for (let y = 1; y < gridHeight - 1; y++) {
+          // 中央の通路部分は空けておく
+          if (y >= centerY - passageWidth && y <= centerY + passageWidth) {
+            continue;
+          }
+          
+          // 通路の左右の部分に壁を作る（ボトルネック部分）
+          if (x >= centerX - 10 && x <= centerX + 10) {
+            obstacles.push([x, y]);
+          }
+        }
+      }
+      
+      initializeGrid();
+      
+      // AGVの配置（左右から中央のボトルネックを通過）
+      const agvCount = parseInt(document.getElementById('agvCount').value);
+      agvs = [];
+      
+      // 左側の配置可能エリア
+      const leftPositions = [];
+      for (let x = 2; x < centerX - 11; x++) {
+        for (let y = 2; y < gridHeight - 2; y++) {
+          // 障害物でない場所のみ追加
+          if (!obstacles.some(o => o[0] === x && o[1] === y)) {
+            leftPositions.push({ x, y });
+          }
+        }
+      }
+      
+      // 右側の配置可能エリア
+      const rightPositions = [];
+      for (let x = centerX + 11; x < gridWidth - 2; x++) {
+        for (let y = 2; y < gridHeight - 2; y++) {
+          // 障害物でない場所のみ追加
+          if (!obstacles.some(o => o[0] === x && o[1] === y)) {
+            rightPositions.push({ x, y });
+          }
+        }
+      }
+      
+      // 位置をシャッフル
+      shuffleArray(leftPositions);
+      shuffleArray(rightPositions);
+      
+      // 使用するAGVの数を決定（利用可能な位置の数に基づく）
+      const maxPossibleAGVs = Math.min(leftPositions.length, rightPositions.length, agvCount);
+      const halfCount = Math.ceil(maxPossibleAGVs / 2);
+      
+      // 左から右へ移動するAGV
+      for (let i = 0; i < halfCount; i++) {
+        const startIdx = i % leftPositions.length;
+        const goalIdx = (i * 3) % rightPositions.length; // ゴールをばらつかせる
+        
+        const start = leftPositions[startIdx];
+        const goal = rightPositions[goalIdx];
+        
+        // スタートとゴールが同じでないことを確認
+        if (start.x === goal.x && start.y === goal.y) continue;
+        
+        const agv = new AGV(i, start.x, start.y, goal.x, goal.y);
+        agvs.push(agv);
+        drawNode({ x: goal.x, y: goal.y }, 'goal', agv.color);
+      }
+      
+      // 右から左へ移動するAGV
+      for (let i = 0; i < maxPossibleAGVs - halfCount; i++) {
+        const startIdx = i % rightPositions.length;
+        const goalIdx = (i * 3) % leftPositions.length; // ゴールをばらつかせる
+        
+        const start = rightPositions[startIdx];
+        const goal = leftPositions[goalIdx];
+        
+        // スタートとゴールが同じでないことを確認
+        if (start.x === goal.x && start.y === goal.y) continue;
+        
+        const agv = new AGV(i + halfCount, start.x, start.y, goal.x, goal.y);
+        agvs.push(agv);
+        drawNode({ x: goal.x, y: goal.y }, 'goal', agv.color);
+      }
+      
+      drawAGVs();
+    }
+
+    // ランダムシナリオの設定
+    function setupRandomScenario() {
+      obstacles = [];
+      
+      // 外壁の作成
+      for (let x = 0; x < gridWidth; x++) {
+        obstacles.push([x, 0]);
+        obstacles.push([x, gridHeight - 1]);
+      }
+      for (let y = 0; y < gridHeight; y++) {
+        obstacles.push([0, y]);
+        obstacles.push([gridWidth - 1, y]);
+      }
+      
+      // ランダムに障害物を配置
+      const obstacleCount = Math.floor((gridWidth * gridHeight) * 0.2); // 20%を障害物に
+      for (let i = 0; i < obstacleCount; i++) {
+        const x = Math.floor(Math.random() * (gridWidth - 2)) + 1;
+        const y = Math.floor(Math.random() * (gridHeight - 2)) + 1;
+        
+        // 既存の障害物と重複しないように
+        if (!obstacles.some(o => o[0] === x && o[1] === y)) {
+          obstacles.push([x, y]);
+        }
+      }
+      
+      initializeGrid();
+      initializeAGVs();
+    }
+
+    // 選択されたシナリオを設定
+    function setupSelectedScenario() {
+      const scenario = document.getElementById('scenario').value;
+      
+      switch (scenario) {
+        case 'crossing':
+          setupCrossingScenario();
+          break;
+        case 'bottleneck':
+          setupBottleneckScenario();
+          break;
+        case 'random':
+          setupRandomScenario();
+          break;
+      }
+    }
+
+    // AGVの初期化（ランダムシナリオ用）
+    function initializeAGVs() {
+      const agvCount = parseInt(document.getElementById('agvCount').value);
+      agvs = [];
+
+      // 配置可能な位置をランダムに選択
+      let availablePositions = [];
+      for (let x = 0; x < gridWidth; x++) {
+        for (let y = 0; y < gridHeight; y++) {
+          if (!isObstacle({ x, y })) {
+            availablePositions.push({ x, y });
+          }
+        }
+      }
+
+      // 位置をシャッフル
+      availablePositions = shuffleArray(availablePositions);
+
+      // AGVを作成
+      for (let i = 0; i < agvCount && i * 2 < availablePositions.length; i++) {
+        const startPos = availablePositions[i * 2];
+        const goalPos = availablePositions[i * 2 + 1];
+        
+        const agv = new AGV(i, startPos.x, startPos.y, goalPos.x, goalPos.y);
+        agvs.push(agv);
+        
+        // ゴールを描画
+        drawNode({ x: goalPos.x, y: goalPos.y }, 'goal', agv.color);
+      }
+
+      // AGVを描画
+      drawAGVs();
+    }
+
+    // 配列をシャッフル
+    function shuffleArray(array) {
+      for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+      }
+      return array;
+    }
+
+    // ノードの描画
+    function drawNode(node, className, color = null) {
+      const svg = document.getElementById('grid');
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", 'rect');
+      rect.setAttribute('x', node.x * cellSize);
+      rect.setAttribute('y', node.y * cellSize);
+      rect.setAttribute('width', cellSize);
+      rect.setAttribute('height', cellSize);
+      rect.classList.add(className);
+      if (color) {
+        rect.style.fill = color;
+        rect.style.opacity = '0.5';
+      }
+      svg.appendChild(rect);
+    }
+
+    // AGVの描画
+    function drawAGVs() {
+      const svg = document.getElementById('grid');
+      
+      // 以前のAGV要素を削除
+      const oldAgvs = svg.querySelectorAll('.agv');
+      oldAgvs.forEach(element => element.remove());
+      
+      // 各AGVを描画
+      for (const agv of agvs) {
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", 'circle');
+        circle.setAttribute('cx', agv.x * cellSize + cellSize / 2);
+        circle.setAttribute('cy', agv.y * cellSize + cellSize / 2);
+        circle.setAttribute('r', cellSize / 2 - 2);
+        circle.setAttribute('fill', agv.color);
+        circle.classList.add('agv');
+        if (agv.isWaiting) {
+          circle.classList.add('waiting');
+        }
+        circle.setAttribute('data-id', agv.id);
+        
+        // AGV番号を表示
+        const text = document.createElementNS("http://www.w3.org/2000/svg", 'text');
+        text.setAttribute('x', agv.x * cellSize + cellSize / 2);
+        text.setAttribute('y', agv.y * cellSize + cellSize / 2 + 5);
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('fill', 'white');
+        text.setAttribute('font-size', '12px');
+        text.setAttribute('font-weight', 'bold');
+        text.classList.add('agv');
+        text.textContent = agv.id + 1;
+        
+        svg.appendChild(circle);
+        svg.appendChild(text);
+      }
+      
+      // AGV状態の更新
+      updateAGVStatus();
+    }
+
+    // AGV状態表示の更新
+    function updateAGVStatus() {
+      const statusDiv = document.getElementById('agv-status');
+      statusDiv.innerHTML = '';
+      
+      for (const agv of agvs) {
+        const agvDiv = document.createElement('div');
+        agvDiv.style.color = agv.color;
+        agvDiv.style.marginBottom = '5px';
+        
+        let status = `AGV ${agv.id + 1}: `;
+        if (agv.reachedGoal) {
+          status += `<span class="completed">完了</span> (距離: ${agv.totalDistance.toFixed(1)}, 待機: ${agv.waitingTime})`;
+        } else if (agv.isWaiting) {
+          status += `<span class="waiting">待機中</span> (${agv.waitingTime}サイクル)`;
+        } else {
+          status += `移動中 (残り: ${agv.path.length - agv.currentPathIndex})`;
+        }
+        
+        agvDiv.innerHTML = status;
+        statusDiv.appendChild(agvDiv);
+      }
+    }
+
+    // 障害物の描画
+    function drawObstacle(obstacle) {
+      const svg = document.getElementById('grid');
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", 'rect');
+      rect.setAttribute('x', obstacle[0] * cellSize);
+      rect.setAttribute('y', obstacle[1] * cellSize);
+      rect.setAttribute('width', cellSize);
+      rect.setAttribute('height', cellSize);
+      rect.classList.add('obstacle');
+      svg.appendChild(rect);
+    }
+
+    // パスを描画
+    function drawPath(node1, node2, color) {
+      const svg = document.getElementById('grid');
+      const line = document.createElementNS("http://www.w3.org/2000/svg", 'line');
+      line.setAttribute('x1', node1.x * cellSize + cellSize / 2);
+      line.setAttribute('y1', node1.y * cellSize + cellSize / 2);
+      line.setAttribute('x2', node2.x * cellSize + cellSize / 2);
+      line.setAttribute('y2', node2.y * cellSize + cellSize / 2);
+      line.setAttribute('stroke', color);
+      line.classList.add('path');
+      svg.appendChild(line);
+    }
+
+    // 障害物かどうかを判定
+    function isObstacle(node) {
+      return obstacles.some(obstacle => obstacle[0] === node.x && obstacle[1] === node.y);
+    }
+
+    // 他のAGVが占有しているかどうかを判定
+    function isOccupiedByOtherAGV(node, currentAGV, otherAGVs) {
+      return otherAGVs.some(agv => 
+        agv.id !== currentAGV.id && 
+        !agv.reachedGoal && 
+        agv.x === node.x && 
+        agv.y === node.y
+      );
+    }
+
+    // 隣接ノードを取得
+    function getNeighbors(node) {
+      const neighbors = [];
+      const directions = [
+        { x: 0, y: -1 }, // 上
+        { x: 1, y: 0 },  // 右
+        { x: 0, y: 1 },  // 下
+        { x: -1, y: 0 }, // 左
+      ];
+
+      for (const dir of directions) {
+        const x = node.x + dir.x;
+        const y = node.y + dir.y;
+
+        if (x >= 0 && x < gridWidth && y >= 0 && y < gridHeight) {
+          neighbors.push(gridData[x][y]);
+        }
+      }
+
+      return neighbors;
+    }
+
+    // シミュレーションの実行
+    function runSimulation(algorithm) {
+      if (algorithmRunning) {
+        alert('シミュレーションが既に実行中です。リセットしてから再試行してください。');
+        return;
+      }
+
+      algorithmRunning = true;
+      currentAlgorithm = algorithm;
+      simulationStartTime = Date.now();
+      collisionsAvoided = 0;
+      pathReplans = 0;
+      document.getElementById('collisions').textContent = `Collisions avoided: ${collisionsAvoided}`;
+      document.getElementById('pathReplans').textContent = `Path replans: ${pathReplans}`;
+      document.getElementById('completionTime').textContent = `Completion time: -`;
+      
+      // 各AGVの初期経路計画
+      for (const agv of agvs) {
+        agv.planPath(agvs.filter(a => a.id !== agv.id));
+      }
+
+      // シミュレーションループを開始
+      const simSpeed = parseInt(document.getElementById('simSpeed').value);
+      updateStatus(`Starting ${algorithm.toUpperCase()} simulation...`);
+      simulationInterval = setInterval(() => simulationStep(algorithm), simSpeed);
+    }
+
+    // シミュレーションステップ
+    function simulationStep(algorithm) {
+      let allReachedGoal = true;
+      const activeAGVs = agvs.filter(agv => !agv.reachedGoal);
+      
+      // 各AGVの状態を更新
+      for (const agv of activeAGVs) {
+        allReachedGoal = false;
+        
+        // 他のAGVとの衝突を確認
+        const otherAGVs = agvs.filter(a => a.id !== agv.id);
+        const willCollide = agv.willCollideWith(otherAGVs);
+        
+        if (willCollide) {
+          collisionsAvoided++;
+          document.getElementById('collisions').textContent = `Collisions avoided: ${collisionsAvoided}`;
+          
+          if (algorithm === 'dstar') {
+            // D*の場合は経路を再計画
+            agv.isWaiting = true;
+            agv.needsReplanning = true;
+          } else {
+            // A*の場合は一時停止
+            agv.isWaiting = true;
+          }
+        } else {
+          // 待機中で衝突の恐れがなくなった場合
+          if (agv.isWaiting && !agv.needsReplanning) {
+            agv.isWaiting = false;
+          }
+        }
+        
+        // D*アルゴリズムの場合、再計画が必要なら実行
+        if (algorithm === 'dstar' && agv.needsReplanning) {
+          agv.replanPath(otherAGVs);
+        }
+        
+        // AGVを移動
+        agv.move();
+      }
+      
+      // AGVを描画
+      drawAGVs();
+      
+      // すべてのAGVがゴールに到達したか確認
+      if (allReachedGoal) {
+        clearInterval(simulationInterval);
+        const completionTime = (Date.now() - simulationStartTime) / 1000;
+        document.getElementById('completionTime').textContent = `Completion time: ${completionTime.toFixed(2)} seconds`;
+        updateStatus(`All AGVs reached their goals! Simulation complete.`);
+        algorithmRunning = false;
+      }
+    }
+
+    // 静的障害物を追加
+    function addObstacle() {
+      if (algorithmRunning) {
+        alert('シミュレーション実行中は障害物を追加できません。');
+        return;
+      }
+      
+      // ランダムな位置に障害物を追加
+      let x, y;
+      do {
+        x = Math.floor(Math.random() * (gridWidth - 2)) + 1;
+        y = Math.floor(Math.random() * (gridHeight - 2)) + 1;
+      } while (
+        obstacles.some(o => o[0] === x && o[1] === y) || 
+        agvs.some(agv => (agv.x === x && agv.y === y) || (agv.goalX === x && agv.goalY === y))
+      );
+      
+      obstacles.push([x, y]);
+      drawObstacle([x, y]);
+    }
+
+    // シミュレーションをリセット
+    function resetSimulation() {
+      if (simulationInterval) {
+        clearInterval(simulationInterval);
+      }
+      
+      algorithmRunning = false;
+      currentAlgorithm = '';
+      
+      // グリッドを再初期化
+      initializeGrid();
+      
+      // 現在のシナリオを再設定
+      setupSelectedScenario();
+      
+      updateStatus('Simulation reset. Ready to start.');
+      document.getElementById('collisions').textContent = 'Collisions avoided: 0';
+      document.getElementById('pathReplans').textContent = 'Path replans: 0';
+      document.getElementById('completionTime').textContent = 'Completion time: -';
+    }
+
+    // ステータスの更新
+    function updateStatus(message) {
+      document.getElementById('status').textContent = `Status: ${message}`;
+    }
+
+    // 初期化
+    window.onload = function() {
+      setupCrossingScenario();
+    };
+  </script>
+</body>
+</html>
